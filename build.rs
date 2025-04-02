@@ -163,6 +163,11 @@ fn fetch() -> io::Result<()> {
     let _ = std::fs::remove_dir_all(output_base_path.join(&clone_dest_dir));
     let status = Command::new("git")
         .current_dir(&output_base_path)
+        .args(if cfg!(target_os = "windows") {
+            vec!["-c", "core.autocrlf=false"]
+        } else {
+            vec![]
+        })
         .arg("clone")
         .arg("--depth=1")
         .arg("-b")
@@ -201,8 +206,43 @@ fn build() -> io::Result<()> {
     // Command's path is not relative to command's current_dir
     let configure_path = source_dir.join("configure");
     assert!(configure_path.exists());
-    let mut configure = Command::new(&configure_path);
+    let mut configure;
+    #[cfg(not(target_os = "windows"))]
+    {
+        configure = Command::new(&configure_path);
+    }
+    // Check if sh exists
+    #[cfg(target_os = "windows")]
+    {
+        let sh_check = Command::new("sh").arg("-c").arg("echo ok").output();
+        match sh_check {
+            Ok(output) if output.status.success() => {
+                // sh exists and works
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to find 'sh.exe', which is required for building FFmpeg",
+                ));
+            }
+        }
+
+        configure = Command::new("sh");
+        configure.arg(configure_path);
+        configure.env("PKG_CONFIG_PATH", "/mingw64/lib/pkgconfig:/mingw64/share/pkgconfig");
+    }
+
     configure.current_dir(&source_dir);
+
+    configure.arg("--disable-everything");
+    configure.arg("--enable-muxer=mp4");
+    configure.arg("--enable-demuxer=mov");
+    configure.arg("--enable-encoder=libx264,libx265");
+    configure.arg("--enable-decoder=h264,hevc");
+    configure.arg("--enable-parser=h264,hevc");
+    configure.arg("--enable-protocol=file");
+    configure.arg("--pkg-config=pkg-config");
+    configure.arg("--pkg-config-flags=--static");
 
     configure.arg(format!("--prefix={}", search().to_string_lossy()));
 
@@ -248,6 +288,7 @@ fn build() -> io::Result<()> {
     // make it static
     configure.arg("--enable-static");
     configure.arg("--disable-shared");
+    #[cfg(not(target_os = "windows"))]
     configure.arg("--enable-pthreads");
 
     configure.arg("--enable-pic");
@@ -503,6 +544,10 @@ fn check_features(
         .target(&env::var("HOST").unwrap()) // don't cross-compile this
         .get_compiler()
         .to_command();
+
+    if env::var("TARGET").unwrap().contains("linux-musl") {
+        compiler.arg("-static");
+    }   
 
     for dir in include_paths {
         compiler.arg("-I");
@@ -821,6 +866,7 @@ fn main() {
             .include_paths
     };
 
+    /*
     if statik && cfg!(target_os = "macos") {
         let frameworks = vec![
             "AppKit",
@@ -844,6 +890,7 @@ fn main() {
             println!("cargo:rustc-link-lib=framework={}", f);
         }
     }
+    */
 
     check_features(
         include_paths.clone(),
@@ -1151,6 +1198,9 @@ fn main() {
         .iter()
         .map(|include| format!("-I{}", include.to_string_lossy()));
 
+    let vars: Vec<_> = std::env::vars().collect();
+    dbg!(vars);
+
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
     // the resulting bindings.
@@ -1160,6 +1210,12 @@ fn main() {
         // https://github.com/rust-lang/rust-bindgen/issues/550
         .blocklist_type("max_align_t")
         .blocklist_function("_.*")
+        .blocklist_function(".*printf")
+        .blocklist_function(".*scanf")
+        .blocklist_function("av_vlog")
+        .blocklist_function("av_log_format_line")
+        .blocklist_function("av_log_format_line2")
+        .blocklist_function("av_log_default_callback")
         // Blocklist functions with u128 in signature.
         // https://github.com/zmwangx/rust-ffmpeg-sys/issues/1
         // https://github.com/rust-lang/rust-bindgen/issues/1549
@@ -1252,6 +1308,10 @@ fn main() {
         .derive_eq(true)
         .size_t_is_usize(true)
         .parse_callbacks(Box::new(Callbacks));
+
+    if let Ok(rust_bindgen_sysroot) = std::env::var("RUST_BINDGEN_SYSROOT") {
+        builder = builder.clang_arg(format!("--sysroot={}", rust_bindgen_sysroot));
+    }
 
     // The input headers we would like to generate
     // bindings for.
